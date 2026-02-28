@@ -40,6 +40,10 @@ export const renderCommand = new Command()
     "Write output to DIR (path is input/project relative)",
   )
   .option(
+    "--jobs",
+    "Number of files to render in parallel.",
+  )
+  .option(
     "-M, --metadata",
     "Metadata value (KEY:VALUE).",
   )

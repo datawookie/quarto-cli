@@ -246,6 +246,7 @@ export interface RenderFlags extends PandocFlags {
   paramsFile?: string;
   clean?: boolean;
   debug?: boolean;
+  jobs?: number;
   quiet?: boolean;
   version?: string;
 }

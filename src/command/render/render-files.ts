@@ -116,6 +116,9 @@ import { NotebookContext } from "../../render/notebook/notebook-types.ts";
 import { setExecuteEnvironment } from "../../execute/environment.ts";
 import { safeCloneDeep } from "../../core/safe-clone-deep.ts";
 import { warn } from "log";
+import { Semaphore } from "../../core/lib/semaphore.ts";
+
+const executeSemaphore = new Semaphore(1);
 
 export async function renderExecute(
   context: RenderContext,
@@ -232,9 +235,12 @@ export async function renderExecute(
     handledLanguages: languages(),
     project: context.project,
   };
-  // execute computations
-  setExecuteEnvironment(executeOptions);
-  const executeResult = await context.engine.execute(executeOptions);
+  // setExecuteEnvironment mutates process env vars, so execute is serialized.
+  // This keeps parallel file rendering safe while avoiding env races.
+  const executeResult = await executeSemaphore.runExclusive(async () => {
+    setExecuteEnvironment(executeOptions);
+    return await context.engine.execute(executeOptions);
+  });
   popTiming();
 
   // write the freeze file if we are in a project
@@ -293,6 +299,8 @@ export async function renderFiles(
   pandocRenderer: PandocRenderer | undefined,
   project: ProjectContext,
 ): Promise<RenderFilesResult> {
+  const hasCustomPandocRenderer = pandocRenderer !== undefined;
+
   // provide default renderer
   pandocRenderer = pandocRenderer || defaultPandocRenderer(options, project);
 
@@ -312,6 +320,27 @@ export async function renderFiles(
 
     // calculate num width
     const numWidth = String(files.length).length;
+
+    // render files in parallel when requested and using the default renderer
+    const jobs = resolveRenderJobs(options.flags?.jobs);
+    if (jobs > 1 && files.length > 1 && !hasCustomPandocRenderer) {
+      const result = await renderFilesInParallel(
+        files,
+        options,
+        notebookContext,
+        alwaysExecuteFiles,
+        project,
+        tempContext,
+        pandocQuiet,
+        progress,
+        numWidth,
+        jobs,
+      );
+      if (progress) {
+        info("");
+      }
+      return result;
+    }
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -368,6 +397,135 @@ export async function renderFiles(
       );
     }
   }
+}
+
+async function renderFilesInParallel(
+  files: RenderFile[],
+  options: RenderOptions,
+  notebookContext: NotebookContext,
+  alwaysExecuteFiles: string[] | undefined,
+  project: ProjectContext,
+  tempContext: TempContext,
+  pandocQuiet: boolean,
+  progress: boolean,
+  numWidth: number,
+  jobs: number,
+): Promise<RenderFilesResult> {
+  const results: Array<RenderFilesResult | undefined> = new Array(files.length);
+  const sharedLifetime = new Lifetime();
+
+  let nextFile = 0;
+  let completed = 0;
+  let firstError: Error | undefined;
+
+  const workerCount = Math.min(jobs, files.length);
+
+  const renderWorker = async () => {
+    while (true) {
+      if (firstError) {
+        return;
+      }
+
+      const fileIndex = nextFile++;
+      if (fileIndex >= files.length) {
+        return;
+      }
+
+      const file = files[fileIndex];
+      const result = await renderSingleFileWithDefaultRenderer(
+        sharedLifetime,
+        file,
+        options,
+        project,
+        tempContext,
+        alwaysExecuteFiles,
+        pandocQuiet,
+        notebookContext,
+      );
+
+      results[fileIndex] = result;
+
+      if (result.error && firstError === undefined) {
+        firstError = result.error;
+      }
+
+      completed++;
+      if (progress) {
+        renderProgress(
+          `\r[${String(completed).padStart(numWidth)}/${files.length}] ${
+            relative(project.dir, file.path)
+          }`,
+        );
+      }
+    }
+  };
+
+  try {
+    await Promise.all(
+      Array.from({ length: workerCount }, () => renderWorker()),
+    );
+  } finally {
+    await sharedLifetime.cleanup();
+  }
+
+  const renderedFiles: RenderedFile[] = [];
+  for (const result of results) {
+    if (result?.files.length) {
+      renderedFiles.push(...result.files);
+    }
+  }
+
+  return {
+    files: renderedFiles,
+    error: firstError,
+  };
+}
+
+async function renderSingleFileWithDefaultRenderer(
+  lifetime: Lifetime,
+  file: RenderFile,
+  options: RenderOptions,
+  project: ProjectContext,
+  tempContext: TempContext,
+  alwaysExecuteFiles: string[] | undefined,
+  pandocQuiet: boolean,
+  notebookContext: NotebookContext,
+): Promise<RenderFilesResult> {
+  const pandocRenderer = defaultPandocRenderer(options, project);
+
+  try {
+    await renderFileInternal(
+      lifetime,
+      file,
+      options,
+      project,
+      pandocRenderer,
+      [file],
+      tempContext,
+      alwaysExecuteFiles,
+      pandocQuiet,
+      notebookContext,
+    );
+
+    return await pandocRenderer.onComplete(false, options.flags?.quiet);
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      warn(`Error encountered when rendering ${file.path}`);
+    }
+    return {
+      files: (await pandocRenderer.onComplete(true)).files,
+      error: error instanceof Error
+        ? error
+        : new Error(error ? String(error) : undefined),
+    };
+  }
+}
+
+function resolveRenderJobs(jobs?: number): number {
+  if (jobs === undefined || !Number.isFinite(jobs) || jobs < 1) {
+    return 1;
+  }
+  return Math.trunc(jobs);
 }
 
 export async function renderFile(

@@ -289,6 +289,11 @@ export async function parseRenderFlags(args: string[]) {
         arg = argsStack.shift();
         break;
 
+      case "--jobs":
+        arg = argsStack.shift();
+        flags.jobs = parsePositiveInt("--jobs", arg);
+        break;
+
       case "-P":
       case "--execute-param":
         arg = argsStack.shift();
@@ -436,6 +441,7 @@ export function fixupPandocArgs(pandocArgs: string[], flags: RenderFlags) {
   removeArgs.set("--clean", false);
   removeArgs.set("--no-clean", false);
   removeArgs.set("--debug", false);
+  removeArgs.set("--jobs", true);
   removeArgs.set("--metadata-file", true);
   removeArgs.set("--latex-makeindex-opt", true);
   removeArgs.set("--latex-tlmgr-opt", true);
@@ -547,4 +553,15 @@ function parseNumbers(flag: string, value?: string): number[] {
   throw new Error(
     `Invalid value for ${flag} (should be a comma separated list of numbers)`,
   );
+}
+
+function parsePositiveInt(flag: string, value?: string): number {
+  if (value !== undefined) {
+    const number = parseInt(value, 10);
+    if (!isNaN(number) && number > 0) {
+      return number;
+    }
+  }
+
+  throw new Error(`Invalid value for ${flag} (should be a positive integer)`);
 }
